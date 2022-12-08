@@ -1,0 +1,22 @@
+name: Github Action
+
+on:
+  pull_request:  # trigger on pull requests
+  push:
+    branches:
+      - master    # trigger on push to master
+      - ci
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rust: stable
+    steps:
+      - uses: actions/checkout@v2
+      - name: Test
+        run: |
+          cargo test

@@ -306,6 +306,60 @@ impl<T> InnerQueue<T> {
     }
 }
 
+impl<T> InnerQueue<T> {
+    pub fn is_empty(&self) -> bool {
+        let (ch, cb) = self.get_chead_and_block();
+        let reserved = unsafe { (*cb).reserved.load(self.offset_size) };
+
+        if reserved.offset < self.block_size {
+            let committed = unsafe { (*cb).committed.load(self.offset_size) };
+            reserved.offset == committed.offset
+        } else {
+            let nblock = unsafe { self.blocks_ptr.add((ch.index + 1) % self.block_num) };
+            let committed = unsafe { (*nblock).committed.load(self.offset_size) };
+
+            committed.version != ch.version + 1
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        let (ch, cb) = self.get_chead_and_block();
+        let (ph, pb) = self.get_phead_and_block();
+        let consumed = unsafe { (*cb).consumed.load(self.offset_size) };
+        let committed = unsafe { (*pb).committed.load(self.offset_size) };
+
+        if ch.index < ph.index {
+            let mut sum = (ph.index - ch.index).saturating_sub(1) * self.block_size;
+            sum += self.block_size.saturating_sub(consumed.offset);
+            sum += committed.offset;
+            sum
+        } else if ch.index == ph.index {
+            if committed.version > consumed.version {
+                // ring back on same block
+                let mut sum =
+                    (ph.index + (self.block_num - ch.index).saturating_sub(1)) * self.block_size;
+                sum += self.block_size.saturating_sub(consumed.offset);
+                sum += committed.offset;
+                sum
+            } else {
+                // on same version, not ring back
+                if consumed.offset >= self.block_size && committed.offset != consumed.offset {
+                    committed.offset
+                } else {
+                    committed.offset - consumed.offset
+                }
+            }
+        } else {
+            // ring back
+            let mut sum =
+                (ph.index + (self.block_num - ch.index).saturating_sub(1)) * self.block_size;
+            sum += self.block_size.saturating_sub(consumed.offset);
+            sum += committed.offset;
+            sum
+        }
+    }
+}
+
 impl<T> Drop for InnerQueue<T> {
     fn drop(&mut self) {
         unsafe {
@@ -346,28 +400,20 @@ impl<T> Block<T> {
 
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        // question: how to release drop old mode memory?
-        let reserved = version_offset(self.reserved.0.load(Ordering::Relaxed), self.offset);
+        let consumed = version_offset(self.consumed.0.load(Ordering::Relaxed), self.offset);
         let committed = version_offset(self.committed.0.load(Ordering::Relaxed), self.offset);
 
-        if reserved.offset < self.capacity
-            && reserved.offset < committed.offset
-            && reserved.version == committed.version
-        {
-            for i in reserved.offset..committed.offset {
-                unsafe {
-                    self.data_ptr.add(i).drop_in_place();
-                }
+        // drop all consumed to committed
+        for i in consumed.offset..std::cmp::min(committed.offset, self.capacity) {
+            unsafe {
+                self.data_ptr.add(i).drop_in_place();
             }
         }
 
-        if reserved.version + 1 == committed.version {
-            for i in 0..committed.offset {
-                unsafe {
-                    self.data_ptr.add(i).drop_in_place();
-                }
-            }
-            for i in reserved.offset..self.capacity {
+        // if block consumed doesn't start, drop all committed
+        // here must be version bump on committed
+        if consumed.version < committed.version {
+            for i in 0..std::cmp::min(committed.offset, self.capacity) {
                 unsafe {
                     self.data_ptr.add(i).drop_in_place();
                 }

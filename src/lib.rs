@@ -44,6 +44,14 @@ impl<T> BQueue<T> {
         BQueue(Arc::new(q))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn push(&self, data: T) -> Result<(), PushError<T>> {
         loop {
             let (ph, block) = self.0.get_phead_and_block();
@@ -180,36 +188,77 @@ mod test {
     #[test]
     fn test_bqueue_push_pop_2() {
         let (tx, rx) = {
-            let tx = LQueue::new(2, 2);
+            let tx = BQueue::new(2, 2);
             let rx = tx.clone();
             (tx, rx)
         };
 
+        assert!(tx.is_empty());
+        assert_eq!(tx.len(), 0);
         tx.push(1).unwrap();
+        assert_eq!(tx.len(), 1);
+        assert!(!tx.is_empty());
 
         tx.push(2).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 2);
 
         tx.push(3).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 3);
 
         tx.push(4).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 4);
 
         assert_eq!(rx.pop().unwrap(), 1);
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 3);
 
         assert_eq!(rx.pop().unwrap(), 2);
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 2);
 
         assert_eq!(rx.pop().unwrap(), 3);
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 1);
 
         assert_eq!(rx.pop().unwrap(), 4);
+        assert!(tx.is_empty());
+        assert_eq!(tx.len(), 0);
 
         tx.push(1).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 1);
 
         tx.push(2).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 2);
 
         tx.push(3).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 3);
 
         tx.push(4).unwrap();
+        assert!(!tx.is_empty());
+        assert_eq!(tx.len(), 4);
 
         assert_eq!(rx.pop().unwrap(), 1);
+        assert_eq!(tx.len(), 3);
+
+        assert_eq!(rx.pop().unwrap(), 2);
+        assert_eq!(tx.len(), 2);
+
+        tx.push(4).unwrap();
+        assert_eq!(tx.len(), 3);
+        tx.push(5).unwrap();
+        assert_eq!(tx.len(), 4);
+
+        assert_eq!(rx.pop().unwrap(), 3);
+        assert_eq!(tx.len(), 3);
+
+        assert_eq!(rx.pop().unwrap(), 4);
+        assert_eq!(tx.len(), 2);
     }
 
     #[test]
@@ -240,14 +289,15 @@ mod test {
             }
         };
 
+        assert!(tx.is_empty());
         tx.push(1).unwrap();
-
+        assert!(!tx.is_empty());
         tx.push(2).unwrap();
-
+        assert!(!tx.is_empty());
         tx.push(3).unwrap();
-
+        assert!(!tx.is_empty());
         assert_eq!(tx.push(10).unwrap_err(), PushError::Full(10));
-
+        assert!(!tx.is_empty());
         assert_ph(
             &tx,
             Header {
@@ -265,6 +315,7 @@ mod test {
         );
 
         assert_eq!(rx.pop().unwrap(), 1);
+        assert!(!tx.is_empty());
         assert_ch(
             &tx,
             Header {
@@ -282,6 +333,7 @@ mod test {
         );
 
         assert_eq!(rx.pop().unwrap(), 2);
+        assert!(!tx.is_empty());
         assert_ch(
             &tx,
             Header {
@@ -298,8 +350,10 @@ mod test {
             },
         );
         assert_eq!(rx.pop().unwrap(), 3);
+        assert!(tx.is_empty());
         assert_eq!(tx.pop().unwrap_err(), PopError::Empty);
         tx.push(4).unwrap();
+        assert!(!tx.is_empty());
         assert_ph(
             &tx,
             Header {
@@ -317,6 +371,7 @@ mod test {
         );
 
         tx.push(5).unwrap();
+        assert!(!tx.is_empty());
         assert_ph(
             &tx,
             Header {
@@ -334,6 +389,7 @@ mod test {
         );
 
         tx.push(6).unwrap();
+        assert!(!tx.is_empty());
         assert_ph(
             &tx,
             Header {
@@ -366,17 +422,23 @@ mod test {
         );
 
         assert_eq!(tx.push(10).unwrap_err(), PushError::Full(10));
+        assert!(!tx.is_empty());
 
         assert_eq!(rx.pop().unwrap(), 4);
+        assert!(!tx.is_empty());
 
         assert_eq!(rx.pop().unwrap(), 5);
+        assert!(!tx.is_empty());
 
         assert_eq!(rx.pop().unwrap(), 6);
+        assert!(tx.is_empty());
         assert_eq!(tx.pop().unwrap_err(), PopError::Empty);
 
         tx.push(7).unwrap();
+        assert!(!tx.is_empty());
 
         assert_eq!(rx.pop().unwrap(), 7);
+        assert!(tx.is_empty());
         assert_eq!(tx.pop().unwrap_err(), PopError::Empty);
     }
 
@@ -440,33 +502,6 @@ mod test {
         assert!(tx.push(2).is_err())
     }
 
-    // #[test]
-    // fn test_drops_lqueue() {
-    //     static DROPS: AtomicUsize = AtomicUsize::new(0);
-
-    //     use rand::{thread_rng, Rng};
-    //     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    //     #[derive(Debug, PartialEq)]
-    //     struct DropCounter;
-
-    //     impl Drop for DropCounter {
-    //         fn drop(&mut self) {
-    //             DROPS.fetch_add(1, Ordering::SeqCst);
-    //         }
-    //     }
-
-    //     let tx = LQueue::new(3, 5);
-    //     let item = rand::thread_rng().gen_range(0..if cfg!(miri) { 100 } else { 10_000 });
-
-    //     for _ in 0..30 {
-    //         tx.push(DropCounter).unwrap();
-    //     }
-
-    //     drop(tx);
-    //     assert_eq!(DROPS.load(Ordering::SeqCst), 30)
-    // }
-
     #[test]
     fn test_drops_bqueue() {
         const RUNS: usize = if cfg!(miri) { 10 } else { 100 };
@@ -489,11 +524,11 @@ mod test {
 
         for _ in 0..RUNS {
             let steps = rng.gen_range(0..if cfg!(miri) { 100 } else { 10_000 });
-            let mut additional = rng.gen_range(0..50);
+            let additional = rng.gen_range(0..50);
 
             DROPS.store(0, Ordering::SeqCst);
             let (mut p, c) = {
-                let tx = BQueue::new(60, 5);
+                let tx = BQueue::new(10, 6);
                 let rx = tx.clone();
                 (tx, rx)
             };
@@ -515,10 +550,11 @@ mod test {
             pop_thread.join().unwrap();
 
             for i in 0..additional {
-                if p.push(DropCounter).is_err() {
-                    additional = additional - (additional - i);
-                    break;
-                }
+                p.push(DropCounter).unwrap()
+                // if p.push(DropCounter).is_err() {
+                //     additional = additional - (additional - i);
+                //     break;
+                // }
             }
 
             assert_eq!(DROPS.load(Ordering::SeqCst), steps);
