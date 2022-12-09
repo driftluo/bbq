@@ -1,29 +1,31 @@
+use cache_padded::CachePadded;
 use std::{
     marker::PhantomData,
     mem::ManuallyDrop,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 pub(crate) enum State<T> {
-    BlockDone(u64),
+    BlockDone(usize),
     NotAvailable,
     Success,
     Allocated(EntryDesc<T>),
     Reserved(EntryDesc<T>),
+    ReservedBlock(ReadBlock<T>),
     NoEntry,
 }
 
 pub(crate) struct EntryDesc<T> {
     block: *mut Block<T>,
     offset: usize,
-    version: u64,
+    #[allow(dead_code)]
+    version: usize,
 }
 
 pub(crate) struct InnerQueue<T> {
     phead: RawHeader,
     chead: RawHeader,
 
-    retry_new: bool,
     block_size: usize,
     block_num: usize,
     pub(crate) offset_size: u32,
@@ -70,12 +72,7 @@ impl<T> InnerQueue<T> {
             block_num,
             offset_size,
             blocks_ptr: ptr,
-            retry_new: true,
         }
-    }
-    pub fn retry_new(mut self, retry_new: bool) -> Self {
-        self.retry_new = retry_new;
-        self
     }
 }
 
@@ -109,6 +106,7 @@ impl<T> InnerQueue<T> {
             assert!(!(*e.block).data_ptr.is_null());
             let ptr = (*e.block).data_ptr.add(e.offset);
             assert!(!ptr.is_null());
+            // drop old must drop old data first
             ptr.write(data);
             (*e.block).committed.faa(1);
         }
@@ -135,7 +133,7 @@ impl<T> InnerQueue<T> {
                 version: ph.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
 
         (*nblock).allocated.max(
@@ -143,7 +141,7 @@ impl<T> InnerQueue<T> {
                 version: ph.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
 
         ph.index = (ph.index + 1) % self.block_num;
@@ -151,10 +149,11 @@ impl<T> InnerQueue<T> {
             ph.version += 1
         }
 
-        self.phead.max(ph.into_u64(self.offset_size));
+        self.phead.max(ph.into_usize(self.offset_size));
         State::Success
     }
 
+    #[cfg(test)]
     pub unsafe fn advance_phead_drop_old(&self, mut ph: Header) -> State<T> {
         let nblock = self.blocks_ptr.add((ph.index + 1) % self.block_num);
 
@@ -169,7 +168,7 @@ impl<T> InnerQueue<T> {
                 version: ph.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
 
         (*nblock).allocated.max(
@@ -177,15 +176,44 @@ impl<T> InnerQueue<T> {
                 version: ph.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
 
         ph.index = (ph.index + 1) % self.block_num;
         if ph.index == 0 {
             ph.version += 1
         }
-        self.phead.max(ph.into_u64(self.offset_size));
+        self.phead.max(ph.into_usize(self.offset_size));
         State::Success
+    }
+}
+
+pub(crate) struct ReadBlock<T> {
+    b: *mut Block<T>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl<T> ReadBlock<T> {
+    pub fn next(&mut self) -> Option<T> {
+        if self.start == self.end {
+            None
+        } else {
+            let res = unsafe { (*self.b).data_ptr.add(self.start).read() };
+            self.start += 1;
+            Some(res)
+        }
+    }
+}
+
+unsafe impl<T: Send> Send for ReadBlock<T> {}
+
+impl<T> Drop for ReadBlock<T> {
+    fn drop(&mut self) {
+        for i in self.start..self.end {
+            unsafe { (*self.b).data_ptr.add(i).drop_in_place() }
+        }
+        unsafe { (*self.b).consumed.0.store(self.end, Ordering::Release) }
     }
 }
 
@@ -193,6 +221,58 @@ impl<T> InnerQueue<T> {
     pub fn get_chead_and_block(&self) -> (Header, *mut Block<T>) {
         let ch = self.chead.load(self.offset_size);
         (ch, unsafe { self.blocks_ptr.add(ch.index) })
+    }
+
+    pub unsafe fn reserve_block(&self, block: *mut Block<T>) -> State<T> {
+        loop {
+            let reserved = (*block).reserved.load(self.offset_size);
+            if reserved.offset < self.block_size {
+                let committed = (*block).committed.load(self.offset_size);
+                if reserved.offset == committed.offset {
+                    return State::NoEntry;
+                }
+
+                if committed.offset != self.block_size {
+                    let allocated = (*block).allocated.load(self.offset_size);
+                    if allocated.offset != committed.offset {
+                        return State::NotAvailable;
+                    }
+                }
+
+                let remain = std::cmp::min(self.block_size, committed.offset);
+
+                match (*block)
+                    .reserved
+                    .0
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                        let a = version_offset(old, self.offset_size);
+                        if a.offset >= self.block_size {
+                            None
+                        } else {
+                            Some(
+                                Cursor {
+                                    offset: remain,
+                                    version: a.version,
+                                }
+                                .into_usize(self.offset_size),
+                            )
+                        }
+                    }) {
+                    Ok(old) => {
+                        let a = version_offset(old, self.offset_size);
+                        return State::ReservedBlock(ReadBlock {
+                            b: block,
+                            start: a.offset,
+                            end: remain,
+                        });
+                    }
+                    Err(_) => {
+                        return State::BlockDone(reserved.version);
+                    }
+                }
+            }
+            return State::BlockDone(reserved.version);
+        }
     }
 
     pub unsafe fn reserve_entry(&self, block: *mut Block<T>) -> State<T> {
@@ -211,7 +291,7 @@ impl<T> InnerQueue<T> {
                     }
                 }
 
-                let raw_reserved = reserved.into_u64(self.offset_size);
+                let raw_reserved = reserved.into_usize(self.offset_size);
 
                 if (*block).reserved.max(raw_reserved + 1) == raw_reserved {
                     return State::Reserved(EntryDesc {
@@ -237,6 +317,7 @@ impl<T> InnerQueue<T> {
         }
     }
 
+    #[cfg(test)]
     pub fn consume_entry_drop_old(&self, e: EntryDesc<T>) -> Option<T> {
         unsafe {
             let ptr = (*e.block).data_ptr.add(e.offset);
@@ -250,7 +331,7 @@ impl<T> InnerQueue<T> {
         }
     }
 
-    pub unsafe fn advance_chead_retry_new(&self, mut ch: Header, _version: u64) -> bool {
+    pub unsafe fn advance_chead_retry_new(&self, mut ch: Header, _version: usize) -> bool {
         let nblock = self.blocks_ptr.add((ch.index + 1) % self.block_num);
 
         let committed = (*nblock).committed.load(self.offset_size);
@@ -264,25 +345,26 @@ impl<T> InnerQueue<T> {
                 version: ch.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
         (*nblock).reserved.max(
             Cursor {
                 version: ch.version + 1,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
 
         ch.index = (ch.index + 1) % self.block_num;
         if ch.index == 0 {
             ch.version += 1
         }
-        self.chead.max(ch.into_u64(self.offset_size));
+        self.chead.max(ch.into_usize(self.offset_size));
         true
     }
 
-    pub unsafe fn advance_chead_drop_old(&self, mut ch: Header, version: u64) -> bool {
+    #[cfg(test)]
+    pub unsafe fn advance_chead_drop_old(&self, mut ch: Header, version: usize) -> bool {
         let nblock = self.blocks_ptr.add((ch.index + 1) % self.block_num);
 
         let committed = (*nblock).committed.load(self.offset_size);
@@ -295,13 +377,13 @@ impl<T> InnerQueue<T> {
                 version: committed.version,
                 offset: 0,
             }
-            .into_u64(self.offset_size),
+            .into_usize(self.offset_size),
         );
         ch.index = (ch.index + 1) % self.block_num;
         if ch.index == 0 {
             ch.version += 1
         }
-        self.chead.max(ch.into_u64(self.offset_size));
+        self.chead.max(ch.into_usize(self.offset_size));
         true
     }
 }
@@ -432,15 +514,15 @@ unsafe impl<T> Send for InnerQueue<T> where T: Send {}
 unsafe impl<T> Sync for InnerQueue<T> where T: Send {}
 
 /// offset and version
-pub(crate) struct RawCursor(AtomicU64);
+pub(crate) struct RawCursor(CachePadded<AtomicUsize>);
 
 impl RawCursor {
     fn init_with_zero() -> Self {
-        RawCursor(AtomicU64::new(0))
+        RawCursor(CachePadded::new(AtomicUsize::new(0)))
     }
 
     fn init(block_size: usize) -> Self {
-        RawCursor(AtomicU64::new(block_size as u64))
+        RawCursor(CachePadded::new(AtomicUsize::new(block_size)))
     }
 
     pub(crate) fn load(&self, off: u32) -> Cursor {
@@ -448,11 +530,11 @@ impl RawCursor {
         version_offset(raw, off)
     }
 
-    fn faa(&self, num: u64) -> u64 {
+    fn faa(&self, num: usize) -> usize {
         self.0.fetch_add(num, Ordering::AcqRel)
     }
 
-    fn max(&self, cur: u64) -> u64 {
+    fn max(&self, cur: usize) -> usize {
         let mut ret = 0;
         while let Err(_) = self
             .0
@@ -467,11 +549,11 @@ impl RawCursor {
 }
 
 /// index and version
-pub(crate) struct RawHeader(AtomicU64);
+pub(crate) struct RawHeader(CachePadded<AtomicUsize>);
 
 impl RawHeader {
     fn init_with_zero() -> Self {
-        RawHeader(AtomicU64::new(0))
+        RawHeader(CachePadded::new(AtomicUsize::new(0)))
     }
 
     fn load(&self, off: u32) -> Header {
@@ -479,7 +561,7 @@ impl RawHeader {
         version_index(raw, off)
     }
 
-    fn max(&self, header: u64) -> u64 {
+    fn max(&self, header: usize) -> usize {
         let mut ret = 0;
         while let Err(_) = self
             .0
@@ -494,53 +576,53 @@ impl RawHeader {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct Cursor {
-    pub(crate) version: u64,
+    pub(crate) version: usize,
     pub(crate) offset: usize,
 }
 
 impl Cursor {
     #[cfg(test)]
     fn into_raw(self, off: u32) -> RawCursor {
-        let raw = self.into_u64(off);
+        let raw = self.into_usize(off);
 
-        RawCursor(AtomicU64::new(raw))
+        RawCursor(CachePadded::new(AtomicUsize::new(raw)))
     }
 
-    fn into_u64(self, off: u32) -> u64 {
-        self.version << off | self.offset as u64
+    fn into_usize(self, off: u32) -> usize {
+        self.version << off | self.offset
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct Header {
-    pub(crate) version: u64,
+    pub(crate) version: usize,
     pub(crate) index: usize,
 }
 
 impl Header {
     #[cfg(test)]
     fn into_raw(self, off: u32) -> RawHeader {
-        let raw = self.into_u64(off);
+        let raw = self.into_usize(off);
 
-        RawHeader(AtomicU64::new(raw))
+        RawHeader(CachePadded::new(AtomicUsize::new(raw)))
     }
 
-    fn into_u64(self, off: u32) -> u64 {
-        self.version << off | self.index as u64
+    fn into_usize(self, off: u32) -> usize {
+        self.version << off | self.index
     }
 }
 
-fn version_offset(raw: u64, offset: u32) -> Cursor {
+fn version_offset(raw: usize, offset: u32) -> Cursor {
     Cursor {
         version: raw >> offset,
-        offset: (raw & !(u64::MAX << offset)) as usize,
+        offset: (raw & !(usize::MAX << offset)),
     }
 }
 
-fn version_index(raw: u64, offset: u32) -> Header {
+fn version_index(raw: usize, offset: u32) -> Header {
     Header {
         version: raw >> offset,
-        index: (raw & !(u64::MAX << offset)) as usize,
+        index: (raw & !(usize::MAX << offset)),
     }
 }
 

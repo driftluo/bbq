@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 mod queue;
 
-use queue::{InnerQueue, State};
+use queue::{InnerQueue, ReadBlock, State};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushError<T> {
@@ -25,7 +25,9 @@ impl<T> Clone for BQueue<T> {
 
 /// There is a problem with this structure, I don't know how to release memory properly after
 /// repeated writes, so I won't open it to users for now
+#[cfg(test)]
 pub(crate) struct LQueue<T>(Arc<InnerQueue<T>>);
+#[cfg(test)]
 impl<T> Clone for LQueue<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -92,16 +94,59 @@ impl<T> BQueue<T> {
             }
         }
     }
+
+    pub fn pop_b<'a>(&'a self) -> Result<RBlock<'a, T>, PopError> {
+        loop {
+            let (ch, block) = self.0.get_chead_and_block();
+            match unsafe { self.0.reserve_block(block) } {
+                State::ReservedBlock(entry) => {
+                    return Ok(RBlock::new(entry));
+                }
+                State::NoEntry => return Err(PopError::Empty),
+                State::NotAvailable => return Err(PopError::Busy),
+                State::BlockDone(vsn) => {
+                    if unsafe { !self.0.advance_chead_retry_new(ch, vsn) } {
+                        return Err(PopError::Empty);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+pub struct RBlock<'a, T> {
+    inner: ReadBlock<T>,
+    _marker: PhantomData<&'a T>,
 }
 
+impl<'a, T> fmt::Debug for RBlock<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rblock")
+            .field("start", &self.inner.start)
+            .field("end", &self.inner.end)
+            .finish()
+    }
+}
+
+impl<'a, T> RBlock<'a, T> {
+    fn new(inner: ReadBlock<T>) -> Self {
+        RBlock {
+            inner,
+            _marker: PhantomData::default(),
+        }
+    }
+}
+
+impl<'a, T> Iterator for RBlock<'a, T> {
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+#[cfg(test)]
 impl<T> LQueue<T> {
     pub fn new(block_size: usize, block_num: usize) -> Self {
-        let q = InnerQueue::new(block_size, block_num).retry_new(false);
-        LQueue(Arc::new(q))
-    }
-
-    pub fn with_capacity(cap: usize) -> Self {
-        let q = InnerQueue::with_capacity(cap).retry_new(false);
+        let q = InnerQueue::new(block_size, block_num);
         LQueue(Arc::new(q))
     }
 
@@ -183,6 +228,39 @@ mod test {
         assert_eq!(rx.pop().unwrap(), 4);
 
         assert_eq!(rx.pop().unwrap_err(), PopError::Empty);
+    }
+
+    #[test]
+    fn test_bqueue_read_block() {
+        let (tx, rx) = {
+            let tx = BQueue::new(2, 2);
+            let rx = tx.clone();
+            (tx, rx)
+        };
+
+        tx.push(1).unwrap();
+        tx.push(2).unwrap();
+        tx.push(3).unwrap();
+        let b = rx.pop_b().unwrap();
+        let b2 = rx.pop_b().unwrap();
+        assert_eq!(rx.pop_b().unwrap_err(), PopError::Empty);
+        assert_eq!(b.collect::<Vec<i32>>(), vec![1, 2]);
+        assert_eq!(b2.collect::<Vec<i32>>(), vec![3]);
+
+        tx.push(1).unwrap();
+        let b = rx.pop_b().unwrap();
+        assert_eq!(rx.pop_b().unwrap_err(), PopError::Empty);
+        assert_eq!(b.collect::<Vec<i32>>(), vec![1]);
+
+        tx.push(1).unwrap();
+        let b = rx.pop_b().unwrap();
+        assert_eq!(rx.pop_b().unwrap_err(), PopError::Empty);
+        assert_eq!(b.collect::<Vec<i32>>(), vec![1]);
+
+        tx.push(1).unwrap();
+        let b = rx.pop_b().unwrap();
+        assert_eq!(rx.pop_b().unwrap_err(), PopError::Empty);
+        assert_eq!(b.collect::<Vec<i32>>(), vec![1]);
     }
 
     #[test]
@@ -549,7 +627,7 @@ mod test {
             p = push_thread.join().unwrap();
             pop_thread.join().unwrap();
 
-            for i in 0..additional {
+            for _ in 0..additional {
                 p.push(DropCounter).unwrap()
                 // if p.push(DropCounter).is_err() {
                 //     additional = additional - (additional - i);

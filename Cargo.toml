@@ -6,6 +6,19 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+cache-padded = "1.1"
 
 [dev-dependencies]
 rand = "0.8"
+criterion = "0.4"
+crossbeam-queue = "0.3.8"
+rtrb = "0.2"
+
+
+[[bench]]
+name = "single_thread_one_byte"
+harness = false
+
+[[bench]]
+name = "two_threads_one_byte"
+harness = false
